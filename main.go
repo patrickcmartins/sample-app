@@ -1,10 +1,10 @@
 // sample-app: serviço HTTP feito para demonstrar a plataforma (canary, retries, timeouts,
-// mTLS, observabilidade). Uma imagem, dois papéis (ROLE):
+// mTLS, observabilidade, cache, eventos). Uma imagem, três papéis (ROLE):
 //
-//	frontend: responde em "/" e chama o backend (BACKEND_URL) para buscar uma cotação
-//	backend:  responde em "/quote"
+//	frontend: responde em "/", chama o backend (BACKEND_URL) e publica um evento no Kafka
+//	backend:  responde em "/quote", com cache-aside no Redis (cache.go)
+//	worker:   consome os eventos do Kafka e agrega no Redis; expõe "/stats" (events.go)
 //
-// Dois serviços se chamando é o mínimo para um trace distribuído mostrar algo útil.
 // Botões de caos por env var: FAILURE_RATE, DELAY, HIGH_CARDINALITY.
 package main
 
@@ -38,7 +38,7 @@ const instrumentation = "github.com/patrickcmartins/sample-app"
 
 type config struct {
 	Port        string
-	Role        string // frontend | backend
+	Role        string // frontend | backend | worker
 	BackendURL  string // frontend: base do backend, ex. http://backend.sample:8080
 	Color       string
 	Message     string
@@ -48,6 +48,14 @@ type config struct {
 	// HighCardinality coloca user_id como atributo da métrica: cada usuário vira uma série nova.
 	// É o erro clássico que explode o Prometheus. Liga, observa, corrige no Collector.
 	HighCardinality bool
+
+	RedisAddr     string        // backend/worker, ex. redis.sample:6379 (vazio = sem cache)
+	RedisTimeout  time.Duration // timeout por comando no caminho quente
+	CacheTTL      time.Duration
+	SourceLatency time.Duration // latência da "fonte" lenta que o cache protege
+	KafkaBrokers  string        // frontend/worker, ex. events-kafka-bootstrap.kafka:9092 (vazio = sem eventos)
+	KafkaTopic    string
+	KafkaGroup    string // worker: consumer group
 }
 
 func loadConfig() config {
@@ -64,8 +72,25 @@ func loadConfig() config {
 		FailureRate:     rate,
 		Delay:           delay,
 		HighCardinality: hc,
+		RedisAddr:       os.Getenv("REDIS_ADDR"),
+		RedisTimeout:    duration("REDIS_TIMEOUT", "100ms"),
+		CacheTTL:        duration("CACHE_TTL", "60s"),
+		SourceLatency:   duration("SOURCE_LATENCY", "200ms"),
+		KafkaBrokers:    os.Getenv("KAFKA_BROKERS"),
+		KafkaTopic:      getenv("KAFKA_TOPIC", "quotes.served"),
+		KafkaGroup:      getenv("KAFKA_GROUP", "quote-stats"),
 	}
 }
+
+func duration(k, def string) time.Duration {
+	d, err := time.ParseDuration(getenv(k, def))
+	if err != nil {
+		d, _ = time.ParseDuration(def)
+	}
+	return d
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }
 
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -99,6 +124,9 @@ type app struct {
 	client *http.Client
 	tracer trace.Tracer
 	quotes metric.Int64Counter
+	cache  *quoteCache // backend
+	pub    *publisher  // frontend
+	worker *worker     // worker
 }
 
 func newApp(cfg config, ready *atomic.Bool, rnd func() float64, log *slog.Logger) *app {
@@ -113,6 +141,9 @@ func newApp(cfg config, ready *atomic.Bool, rnd func() float64, log *slog.Logger
 		client: &http.Client{Timeout: 3 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)},
 		tracer: otel.Tracer(instrumentation),
 		quotes: counter,
+		// Defaults desligados (sem Redis, sem Kafka): main() troca pelos reais conforme o papel.
+		cache: &quoteCache{timeout: 100 * time.Millisecond, sourceMs: 0},
+		pub:   &publisher{log: log},
 	}
 }
 
@@ -142,8 +173,9 @@ func (a *app) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	host, _ := os.Hostname()
 	resp := response{version, a.cfg.Color, a.cfg.Message, a.cfg.Cluster, host, ""}
+	id := int(a.rnd()*float64(len(quotes))) % len(quotes)
 	if a.cfg.BackendURL != "" {
-		q, err := a.fetchQuote(r.Context())
+		q, err := a.fetchQuote(r.Context(), id)
 		if err != nil {
 			// Degradação graciosa: sem backend, o frontend ainda responde (sem a cotação).
 			// Retornar 500 aqui transformaria uma falha parcial em falha total.
@@ -153,13 +185,15 @@ func (a *app) handleRoot(w http.ResponseWriter, r *http.Request) {
 		resp.Quote = q
 	}
 	writeJSON(w, resp)
+	// Depois de responder: publica o evento (assíncrono, não atrasa o usuário).
+	a.pub.publish(r.Context(), quoteEvent{QuoteID: id, Version: version, At: time.Now()})
 }
 
-func (a *app) fetchQuote(ctx context.Context) (string, error) {
+func (a *app) fetchQuote(ctx context.Context, id int) (string, error) {
 	ctx, span := a.tracer.Start(ctx, "fetchQuote")
 	defer span.End()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.BackendURL+"/quote", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.BackendURL+"/quote?id="+itoa(id), nil)
 	if err != nil {
 		return "", err
 	}
@@ -188,15 +222,19 @@ func (a *app) handleQuote(w http.ResponseWriter, r *http.Request) {
 	if a.chaos(w, r) {
 		return
 	}
-	q := quotes[int(a.rnd()*float64(len(quotes)))%len(quotes)]
+	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+	if id < 0 {
+		id = 0
+	}
+	q, source := a.cache.get(r.Context(), id)
 	attrs := []attribute.KeyValue{attribute.String("cluster", a.cfg.Cluster)}
 	if a.cfg.HighCardinality {
 		// ERRADO de propósito: valor ilimitado como label = uma série por usuário.
 		attrs = append(attrs, attribute.String("user_id", strconv.Itoa(rand.Intn(1_000_000))))
 	}
 	a.quotes.Add(r.Context(), 1, metric.WithAttributes(attrs...))
-	a.log.InfoContext(r.Context(), "quote", "quote", q)
-	writeJSON(w, map[string]string{"quote": q})
+	a.log.InfoContext(r.Context(), "quote", "quote", q, "source", source)
+	writeJSON(w, map[string]string{"quote": q, "source": source})
 }
 
 func (a *app) routes() http.Handler {
@@ -209,6 +247,19 @@ func (a *app) routes() http.Handler {
 	switch a.cfg.Role {
 	case "backend":
 		handle("/quote", a.handleQuote)
+	case "worker":
+		mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+			if a.worker == nil {
+				http.Error(w, "worker sem Kafka/Redis configurado", http.StatusServiceUnavailable)
+				return
+			}
+			st, err := a.worker.stats(r.Context())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			writeJSON(w, st)
+		})
 	default:
 		handle("/", a.handleRoot)
 	}
@@ -247,6 +298,32 @@ func main() {
 
 	var ready atomic.Bool
 	a := newApp(cfg, &ready, rand.Float64, log)
+
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+	switch cfg.Role {
+	case "backend":
+		if a.cache, err = newQuoteCache(cfg.RedisAddr, cfg.CacheTTL, cfg.RedisTimeout, cfg.SourceLatency); err != nil {
+			log.Error("redis", "err", err)
+			os.Exit(1)
+		}
+		defer a.cache.close()
+	case "worker":
+		if cfg.KafkaBrokers == "" || cfg.RedisAddr == "" {
+			log.Error("worker precisa de KAFKA_BROKERS e REDIS_ADDR")
+			os.Exit(1)
+		}
+		if a.worker, err = newWorker(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroup, cfg.RedisAddr, cfg.Delay, log); err != nil {
+			log.Error("kafka", "err", err)
+			os.Exit(1)
+		}
+		go a.worker.run(runCtx)
+	default:
+		if a.pub, err = newPublisher(cfg.KafkaBrokers, cfg.KafkaTopic, log); err != nil {
+			log.Error("kafka", "err", err)
+			os.Exit(1)
+		}
+	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           a.routes(),
@@ -273,5 +350,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	stopRun()
+	a.pub.close() // flush dos eventos pendentes antes de sair
+	if a.worker != nil {
+		a.worker.close()
+	}
 	_ = shutdownTelemetry(ctx)
 }

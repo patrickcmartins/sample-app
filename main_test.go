@@ -45,7 +45,8 @@ func TestFrontendCallsBackend(t *testing.T) {
 	rec := get(t, testApp(config{BackendURL: backend.URL}, true, 0.9), "/")
 	var got response
 	_ = json.NewDecoder(rec.Body).Decode(&got)
-	if got.Quote != quotes[0] {
+	// rnd=0.9 no frontend -> id 4 -> o backend devolve quotes[4]
+	if got.Quote != quotes[4] {
 		t.Fatalf("esperava a cotação do backend, veio %q", got.Quote)
 	}
 }

@@ -1,9 +1,26 @@
 # sample-app
 
-Um serviço HTTP em Go feito para demonstrar a plataforma. **Uma imagem, dois papéis** (`ROLE`):
+Um serviço HTTP em Go feito para demonstrar a plataforma. **Uma imagem, três papéis** (`ROLE`):
 
 - `frontend` (default): responde em `/` e chama o backend (`BACKEND_URL`) para buscar uma cotação. Se o backend falhar, **degrada** (responde sem a cotação) em vez de devolver 500.
-- `backend`: responde em `/quote`.
+- `backend`: responde em `/quote`, com **cache-aside no Redis** (timeout de 100 ms; se o Redis cair, faz *fail-open* e vai à fonte lenta).
+- `worker`: consome o tópico Kafka `quotes.served` (consumer group `quote-stats`) e agrega no Redis; `/stats` mostra o resultado.
+
+```
+frontend ──HTTP──▶ backend ──cache-aside──▶ Redis
+   └─ evento quote.served ──▶ Kafka ──▶ worker ──HINCRBY──▶ Redis
+```
+
+**Decisões que valem explicar:**
+
+| Decisão | Por quê |
+|---|---|
+| Publicação assíncrona, `context.WithoutCancel` | O usuário nunca espera o Kafka. Com o ctx do request, o envio era abortado quando o handler respondia (bug real, pego no teste local). |
+| Chave = `quote_id` | Mesma chave, mesma partição: ordem garantida por cotação. |
+| Commit manual depois de processar | *At least once*: se o worker morrer no meio, reprocessa. O processamento tolera duplicata. |
+| Worker repete o Redis com backoff em vez de pular | Nada se perde: o efeito visível é o **lag** crescendo e zerando quando o Redis volta. |
+| Sem auto-criação de tópico | Tópico é infraestrutura: criado por `KafkaTopic` (GitOps), com partições e retenção revisadas em PR. |
+| Trace atravessa o Kafka | O `traceparent` vai nos headers da mensagem (kotel): frontend → Kafka → worker é um trace só. |
 
 ## Observabilidade (OpenTelemetry)
 
@@ -27,6 +44,7 @@ Traces e métricas saem por **OTLP/HTTP** para o Collector, configurados só pel
 |---|---|---|
 | `FAILURE_RATE=0.5` | 50% de HTTP 500 | os retries do Istio escondem a falha do cliente |
 | `DELAY=10s` | latência artificial | o timeout do VirtualService corta em 5s (504) |
+| `REDIS_TIMEOUT`, `SOURCE_LATENCY`, `CACHE_TTL` | timeout do Redis, latência da fonte, TTL do cache | o cache protegendo a fonte; o efeito de um Redis lento |
 | `HIGH_CARDINALITY=true` | o backend põe `user_id` como label da métrica `quotes_served` | explosão de séries no Prometheus; a correção é no Collector |
 
 ## Pipeline
