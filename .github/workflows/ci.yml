@@ -13,7 +13,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -42,7 +42,7 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: meta
         run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
@@ -87,7 +87,7 @@ jobs:
       - name: desligado?
         if: vars.AUTO_DEPLOY_STG != 'true'
         run: echo "::notice::AUTO_DEPLOY_STG != true no environment staging; nada a fazer" && exit 0
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: vars.AUTO_DEPLOY_STG == 'true'
         with:
           repository: ${{ github.repository_owner }}/sample-app-deploy
