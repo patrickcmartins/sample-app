@@ -53,7 +53,8 @@ Traces e métricas saem por **OTLP/HTTP** para o Collector, configurados só pel
 PR   ─► go vet + go test -race
 main ─► build (distroless, nonroot) ─► push ghcr.io:sha-xxxxxxx (+SBOM, provenance)
      ─► trivy (falha em HIGH/CRITICAL) ─► cosign keyless (OIDC)
-     ─► commit em sample-app-deploy/envs/kind-dev  ─► Argo CD sincroniza
+     ─► commit em sample-app-deploy/envs/eks-stg   ─► Argo CD sincroniza stg
+     (prod: PR de promoção stg -> prod no sample-app-deploy, com review)
 ```
 
 Tags são **imutáveis** (`sha-<commit>`). Nunca usamos `latest`. Prod recebe a versão por PR de promoção no `sample-app-deploy`.

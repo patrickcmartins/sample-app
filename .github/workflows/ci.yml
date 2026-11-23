@@ -70,25 +70,35 @@ jobs:
       - name: cosign sign (keyless)
         run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
 
-  # Continuous Delivery para DEV: o CI só escreve no repo de deploy, quem aplica é o Argo CD.
-  # Ative em Settings > Variables: AUTO_DEPLOY_DEV=true (depois de criar o secret DEPLOY_REPO_TOKEN).
-  bump-dev:
+  # Continuous Delivery para STG: o CI só escreve no repo de deploy, quem aplica é o Argo CD.
+  # Toda versão que passa no CI vai para stg; prod só por PR de promoção (sample-app-deploy).
+  # GitHub Environment "staging": guarda o DEPLOY_REPO_TOKEN (secret de ambiente, não do repo)
+  # e registra o histórico de deploys. Ativação: variable AUTO_DEPLOY_STG=true no environment.
+  bump-stg:
     needs: image
-    if: vars.AUTO_DEPLOY_DEV == 'true'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://github.com/${{ github.repository_owner }}/sample-app-deploy/blob/main/envs/eks-stg/values.yaml
     permissions:
       contents: read
     steps:
+      - name: desligado?
+        if: vars.AUTO_DEPLOY_STG != 'true'
+        run: echo "::notice::AUTO_DEPLOY_STG != true no environment staging; nada a fazer" && exit 0
       - uses: actions/checkout@v4
+        if: vars.AUTO_DEPLOY_STG == 'true'
         with:
           repository: ${{ github.repository_owner }}/sample-app-deploy
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
-      - name: atualiza a tag em envs/kind-dev
+      - name: atualiza a tag em envs/eks-stg
+        if: vars.AUTO_DEPLOY_STG == 'true'
         env:
           TAG: ${{ needs.image.outputs.tag }}
         run: |
-          yq -i '.image.tag = strenv(TAG)' envs/kind-dev/values.yaml
+          yq -i '.image.tag = strenv(TAG)' envs/eks-stg/values.yaml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore(kind-dev): sample-app ${TAG}"
+          git commit -am "chore(eks-stg): sample-app ${TAG}"
           git push
