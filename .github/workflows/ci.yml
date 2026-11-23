@@ -19,6 +19,17 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race -cover ./...
+      # Shift left: CVE em dependência (go.sum) quebra o PR, antes de existir imagem.
+      # O trivy da imagem continua no job "image" (pega também a base e o binário final).
+      - name: trivy fs (dependências)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
 
   image:
     needs: test
