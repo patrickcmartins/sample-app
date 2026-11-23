@@ -1,6 +1,19 @@
 # sample-app
 
-Um serviço HTTP em Go, só com stdlib, feito para demonstrar a plataforma.
+Um serviço HTTP em Go feito para demonstrar a plataforma. **Uma imagem, dois papéis** (`ROLE`):
+
+- `frontend` (default): responde em `/` e chama o backend (`BACKEND_URL`) para buscar uma cotação. Se o backend falhar, **degrada** (responde sem a cotação) em vez de devolver 500.
+- `backend`: responde em `/quote`.
+
+## Observabilidade (OpenTelemetry)
+
+Traces e métricas saem por **OTLP/HTTP** para o Collector, configurados só pelas env vars padrão do OTel
+(`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`). Sem endpoint, a telemetria fica desligada.
+
+- `otelhttp` cria um span por request (nome = rota, nunca a URL crua) e propaga o `traceparent` (W3C) para o backend: frontend → backend aparecem no mesmo trace, junto com os spans dos sidecars do Istio.
+- Logs em JSON com `trace_id`/`span_id`: do log no Loki dá para pular para o trace no Tempo.
+- Probes (`/healthz`, `/readyz`) ficam fora do tracing.
+
 
 | Endpoint | |
 |---|---|
@@ -14,6 +27,7 @@ Um serviço HTTP em Go, só com stdlib, feito para demonstrar a plataforma.
 |---|---|---|
 | `FAILURE_RATE=0.5` | 50% de HTTP 500 | os retries do Istio escondem a falha do cliente |
 | `DELAY=10s` | latência artificial | o timeout do VirtualService corta em 5s (504) |
+| `HIGH_CARDINALITY=true` | o backend põe `user_id` como label da métrica `quotes_served` | explosão de séries no Prometheus; a correção é no Collector |
 
 ## Pipeline
 
